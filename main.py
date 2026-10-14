@@ -586,18 +586,20 @@ def _drop_persona_instructions(text: str) -> str:
     return (head + "\n" + rest.lstrip("\n")).strip()
 
 
-def _merged_request_context(req: Any, base: str = "") -> str:
+def _merged_request_context(req: Any, base: str = "", extra: str = "") -> str:
     """别的插件写进这次请求的上下文：``base``（system_prompt）＋临时正文。
 
     AstrBot 4.24.2+ 用这个字段承载「只对当前这一轮有效、不写进对话历史」的内容，
-    世界树（worldtree_lore）这类插件默认就往这儿写设定。本插件接管时是自己拼
-    提示词、自己发请求的，AstrBot 那条「拼进正文」的路不会跑，所以得把这些片段
-    取出来一起带上——不带的话，装了世界树的用户会发现设定在她这一轮突然失效。
+    世界树（worldtree_lore）的设定、helper_tools 的环境感知都往这儿写。
+    本插件接管时是自己拼提示词、自己发请求的，AstrBot 那条「拼进正文」的路不会跑，
+    所以得把这些片段取出来一起带上——不带的话，装了它们的用户会发现注入突然失效。
 
-    老版本 AstrBot 没有这个字段，取不到就当没有。
+    ``extra`` 是调用方另外摘出来的临时信息（例如老版本 AstrBot 上被拼进
+    ``req.prompt`` 的那一段，见 :func:`_split_prompt_injection`）。
+    老版本 AstrBot 没有 ``extra_user_content_parts`` 这个字段，取不到就当没有。
     """
 
-    texts: list[str] = [str(base or "").strip()]
+    texts: list[str] = [str(base or "").strip(), str(extra or "").strip()]
     parts = getattr(req, "extra_user_content_parts", None)
     if parts:
         try:
@@ -608,6 +610,37 @@ def _merged_request_context(req: Any, base: str = "") -> str:
         except Exception:
             pass
     return "\n\n".join(item for item in texts if item)
+
+
+TEMP_CONTEXT_MARKERS = ("[环境感知]",)
+"""别人往 ``req.prompt`` 尾巴上直接拼的「临时信息」标记。
+
+AstrBot 4.24.2+ 有 ``extra_user_content_parts`` 这条正规通道（helper_tools 的
+环境感知、世界树的设定都走它）；更老的版本上插件会退化成"往用户那句话后面拼一段"。
+那段内容不是用户说的话，直接当成用户正文会被她理解成"群友说今天是法定节假日"，
+所以按标记摘出来，放进「其他插件提供的上下文」。
+
+想要扩展这个清单的话，加标记即可——只在"空行 + 标记"这种边界上才认，
+免得用户在正文里随手打出这几个字也被拆开。
+"""
+
+
+def _split_prompt_injection(prompt: str) -> tuple[str, str]:
+    """把 ``req.prompt`` 里被追加的临时信息摘出来：返回（用户说的话, 临时信息）。"""
+
+    text = str(prompt or "")
+    if not text:
+        return "", ""
+    cut = len(text)
+    for marker in TEMP_CONTEXT_MARKERS:
+        for needle in (f"\n\n{marker}", f"\n{marker}"):
+            index = text.find(needle)
+            if index <= 0:
+                continue
+            cut = min(cut, index + len(needle) - len(marker))
+    if cut >= len(text):
+        return text.strip(), ""
+    return text[:cut].strip(), text[cut:].strip()
 
 
 def _selected_provider_extra(event: Any) -> str:
@@ -2503,6 +2536,10 @@ class AstrBotTools:
             name = getattr(tool, "name", "") or ""
             if not name or name in seen:
                 continue
+            # 在 AstrBot 面板上被停用的工具（例如 helper_tools 里关掉的某个模块）
+            # 不会被交给模型，也调不动：不列进清单，免得用户挂成动作之后一头雾水
+            if not bool(getattr(tool, "active", True)):
+                continue
             seen.add(name)
             tools.append(
                 ToolInfo(
@@ -2518,6 +2555,8 @@ class AstrBotTools:
         for tool in self._builtin_tools(manager):
             name = getattr(tool, "name", "") or ""
             if not name or name in seen:
+                continue
+            if not bool(getattr(tool, "active", True)):
                 continue
             seen.add(name)
             tools.append(
@@ -2566,10 +2605,28 @@ class AstrBotTools:
                 tool = None
         if tool is None:
             for candidate in list(getattr(manager, "func_list", []) or []):
-                if getattr(candidate, "name", "") == name:
-                    tool = candidate
-                    break
+                if getattr(candidate, "name", "") != name:
+                    continue
+                # 停用的工具不算"可用"：注释里写清楚原因，比"没有注册"好排查得多
+                if not bool(getattr(candidate, "active", True)):
+                    continue
+                tool = candidate
+                break
         if tool is None:
+            inactive = any(
+                getattr(candidate, "name", "") == name
+                and not bool(getattr(candidate, "active", True))
+                for candidate in list(getattr(manager, "func_list", []) or [])
+            )
+            if inactive:
+                return ToolCallResult(
+                    ok=False,
+                    error=(
+                        f"工具「{name}」在 AstrBot 里被停用了"
+                        "（去提供它的插件配置里打开，或在 WebUI 的工具列表里启用）"
+                    ),
+                    tool=name,
+                )
             return ToolCallResult(ok=False, error=f"工具「{name}」没有注册", tool=name)
         # 借同组事件兜底：工具大多只需要「谁在什么群说的」，没有事件连 call()
         # 都进不去。但绝不借别的会话组的——出图这类工具会按事件的会话发结果。
@@ -3043,7 +3100,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Whereis-Alice（原版 exneverbur）",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.2.0",
+    "v2.2.1",
 )
 class HerWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -3996,6 +4053,14 @@ class HerWorldPlugin(Star):
         user_text = (getattr(req, "prompt", "") or "").strip() or (
             event.get_message_str() or ""
         )
+        # 老版本 AstrBot 上，别的插件（helper_tools 的环境感知这类）会把"只对
+        # 这一轮有效"的信息直接拼在用户那句话后面。那不是群友说的话，摘出来单独带，
+        # 免得她以为是有人在跟她讲"今天是法定节假日"。
+        prompt_injection = ""
+        if user_text:
+            user_text, prompt_injection = _split_prompt_injection(user_text)
+            if not user_text:
+                user_text = event.get_message_str() or ""
         # 注解**之前**的原文：ctx.text 是注解后的文本，事件身份认的是这条消息本身
         raw_text = event.get_message_str() or ""
         identity = _incoming_identity(event, raw_text)
@@ -4033,6 +4098,7 @@ class HerWorldPlugin(Star):
             other_context=_merged_request_context(
                 req,
                 _drop_persona_instructions(getattr(req, "system_prompt", "") or ""),
+                prompt_injection,
             ),
             image_urls=image_urls,
             chat_images=sources,

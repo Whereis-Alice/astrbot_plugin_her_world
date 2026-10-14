@@ -317,6 +317,174 @@ class RequestContextTests(BridgeCase):
         self.assertEqual(self.module._merged_request_context(req, "只有系统提示词"), "只有系统提示词")
         self.assertEqual(self.module._merged_request_context(types.SimpleNamespace()), "")
 
+    def test_helper_tools_perception_reaches_the_prompt(self):
+        """helper_tools 的环境感知（extra_user_content_parts）要原样进她的提示词。"""
+
+        perception = (
+            "[环境感知]\n现在：2026-10-15 20:31（周四，晚上）\n"
+            "平台：aiocqhttp\n群名：写代码的群"
+        )
+        part = types.SimpleNamespace(text=perception)
+        req = types.SimpleNamespace(extra_user_content_parts=[part])
+        merged = self.module._merged_request_context(req, "别的插件写的上下文")
+        self.assertIn("[环境感知]", merged)
+        self.assertIn("2026-10-15 20:31", merged)
+        self.assertIn("写代码的群", merged)
+
+    def test_prompt_appended_injection_is_split_out(self):
+        """老版本 AstrBot 上，环境感知会拼在 req.prompt 后面：要摘出来单独带。"""
+
+        injected = "[环境感知]\n现在：2026-10-15 20:31（周四，晚上）"
+        prompt = f"你在干嘛？\n\n{injected}"
+        user_text, extra = self.module._split_prompt_injection(prompt)
+        self.assertEqual(user_text, "你在干嘛？")
+        self.assertTrue(extra.startswith("[环境感知]"))
+        self.assertIn("20:31", extra)
+        # 摘出来的这一段同时会进「其他插件提供的上下文」
+        merged = self.module._merged_request_context(
+            types.SimpleNamespace(), "基础", extra
+        )
+        self.assertIn("基础", merged)
+        self.assertIn("[环境感知]", merged)
+
+    def test_plain_prompt_is_not_touched(self):
+        """正文里随口打出这几个字、但不是被拼上去的，就不要乱拆。"""
+
+        user_text, extra = self.module._split_prompt_injection(
+            "他说「[环境感知]」是什么意思？"
+        )
+        self.assertEqual(extra, "")
+        self.assertEqual(user_text, "他说「[环境感知]」是什么意思？")
+        # 没有空行边界的尾巴也不当注入
+        user_text, extra = self.module._split_prompt_injection("正文[环境感知]尾巴")
+        self.assertEqual(extra, "")
+        self.assertEqual(user_text, "正文[环境感知]尾巴")
+
+
+class _TakeoverEvent(_Event):
+    """驱动 on_llm_request 的最小事件桩。"""
+
+    def __init__(self, text: str, session: str = "aiocqhttp:GroupMessage:1") -> None:
+        super().__init__()
+        self.unified_msg_origin = session
+        self._text = text
+        self.message_obj = types.SimpleNamespace(message=[_At("1")], message_id="m1")
+
+    def get_message_str(self) -> str:
+        return self._text
+
+    def is_wake_up(self) -> bool:
+        return True
+
+    def get_sender_id(self) -> str:
+        return "42"
+
+    def get_self_id(self) -> str:
+        return "1"
+
+    def get_sender_name(self) -> str:
+        return "tester"
+
+    def is_private_chat(self) -> bool:
+        return False
+
+    def is_stopped(self) -> bool:
+        return False
+
+    def stop_event(self) -> None:
+        return
+
+
+class _At:
+    """假的 @ 段（识别按类名走，所以名字必须叫 At）。"""
+
+    def __init__(self, qq: str) -> None:
+        self.qq = qq
+
+
+class _TakeoverRequest:
+    """驱动 on_llm_request 的最小请求桩。"""
+
+    def __init__(self, prompt: str) -> None:
+        self.prompt = prompt
+        self.system_prompt = ""
+        self.contexts: list = []
+        self.func_tool = None
+        self.extra_user_content_parts: list = []
+
+
+class TakeoverContextTests(BridgeCase):
+    def test_perception_part_lands_in_other_context(self):
+        """整条接管路径上，helper_tools 的环境感知会进「其他插件提供的上下文」。"""
+
+        plugin = self._plugin()
+        plugin.store.add_session("aiocqhttp:GroupMessage:1", session_type="group")
+        plugin.engine.reload_config()
+        event = _TakeoverEvent("今天有什么安排？")
+        req = _TakeoverRequest("今天有什么安排？")
+        req.system_prompt = "别的插件写的系统提示词"
+        req.extra_user_content_parts = [
+            types.SimpleNamespace(
+                text="[环境感知]\n现在：2026-10-15 20:31（周四，晚上）\n群名：写代码的群"
+            )
+        ]
+        captured: dict = {}
+
+        async def fake_reply(ctx, history=None):
+            captured["ctx"] = ctx
+            from core.engine import ReplyOutcome
+
+            return ReplyOutcome(ok=True, messages=["嗯"])
+
+        async def passthrough(_event, messages, tail=""):
+            return list(messages), []
+
+        plugin.engine.handle_reply = fake_reply  # type: ignore[assignment]
+        plugin._bridge_reply_hooks = passthrough  # type: ignore[assignment]
+        try:
+            asyncio.run(plugin.on_llm_request(event, req))
+        finally:
+            plugin.db.raw.close()
+        ctx = captured.get("ctx")
+        self.assertIsNotNone(ctx, "接管没有被触发（会话白名单没生效？）")
+        self.assertIn("[环境感知]", ctx.other_context)
+        self.assertIn("2026-10-15 20:31", ctx.other_context)
+        self.assertIn("别的插件写的系统提示词", ctx.other_context)
+        # 注入的感知文本没有被当成用户说的话
+        self.assertEqual(ctx.text, "今天有什么安排？")
+
+    def test_prompt_appended_perception_is_kept_out_of_user_text(self):
+        """老版本 AstrBot 上感知文本拼在 req.prompt 后面：正文要干净，感知要带上。"""
+
+        plugin = self._plugin()
+        plugin.store.add_session("aiocqhttp:GroupMessage:1", session_type="group")
+        plugin.engine.reload_config()
+        injected = "[环境感知]\n现在：2026-10-15 20:31（周四，晚上）"
+        event = _TakeoverEvent(f"今天有什么安排？\n\n{injected}")
+        req = _TakeoverRequest(f"今天有什么安排？\n\n{injected}")
+        captured: dict = {}
+
+        async def fake_reply(ctx, history=None):
+            captured["ctx"] = ctx
+            from core.engine import ReplyOutcome
+
+            return ReplyOutcome(ok=True, messages=["嗯"])
+
+        async def passthrough(_event, messages, tail=""):
+            return list(messages), []
+
+        plugin.engine.handle_reply = fake_reply  # type: ignore[assignment]
+        plugin._bridge_reply_hooks = passthrough  # type: ignore[assignment]
+        try:
+            asyncio.run(plugin.on_llm_request(event, req))
+        finally:
+            plugin.db.raw.close()
+        ctx = captured.get("ctx")
+        self.assertIsNotNone(ctx)
+        self.assertEqual(ctx.text, "今天有什么安排？")
+        self.assertIn("[环境感知]", ctx.other_context)
+        self.assertIn("20:31", ctx.other_context)
+
 
 class TurnProviderTests(BridgeCase):
     def test_selected_provider_is_used_for_main_call(self):

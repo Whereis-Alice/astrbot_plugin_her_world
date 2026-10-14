@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v2.2.0-4f6bf5" alt="version" />
+  <img src="https://img.shields.io/badge/version-v2.2.1-4f6bf5" alt="version" />
   <img src="https://img.shields.io/badge/AstrBot-%E2%89%A5%204.20.0-8b6cf0" alt="AstrBot" />
   <img src="https://img.shields.io/badge/dependencies-%E6%97%A0-brightgreen" alt="dependencies" />
 </p>
@@ -106,8 +106,13 @@
 | [**meme_magpie**（表情神偷）](https://github.com/Whereis-Alice/astrbot_plugin_meme_magpie) | 它挂在「发送前」钩子上贴表情包图片。接管时我们会把这个钩子补发一遍，并且**把图片原样发出去**（以前只捞文本，图片会被丢掉）。它的搜索 / 发送 / 收录三个工具也能用「从工具导入…」挂成她的动作。 |
 | [**genie_tts_llm**](https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm) | 它在「模型响应后」把回复换成一段语音。接管时我们同样补发这个钩子，并识别出"整条回复已经被换成语音"，于是**只发语音、不再把同一句话念两遍**；「文字 + 语音」模式两者都会发。它的 `genie_tts_speak` 工具也能导入成动作。 |
 | [**worldtree_lore**（世界树）](https://github.com/Whereis-Alice/astrbot_plugin_worldtree_lore) | 它把设定写进 `system_prompt` 或 `extra_user_content_parts`，还会临时指定模型。接管时这两样都会跟着走：设定进她的提示词，临时模型也用于这一轮回复；它自己的工具同样可以导入成动作。 |
+| [**helper_tools**（助手工具集）](https://github.com/Whereis-Alice/astrbot_plugin_helper_tools) | **环境感知**（时间 / 节假日 / 农历 / 节气 / 平台 / 群名 / 发言人资料 / Bot 群身份）挂在 `on_llm_request` 上、写进 `extra_user_content_parts`，接管时会被原样带进「其他插件提供的上下文」；它的引用媒体标注、戳一戳上下文同理。老版本 AstrBot 上这些内容会退化成拼在用户那句话后面，本插件会把它们摘出来单独带，不会误当成群友说的话。它注册的 LLM 工具（推特 / 网页浏览 / QQ 信息 / 今日小猪 / 语音…）都能在动作库里一键导入；被它在面板上关掉的模块不会出现在可导入列表里。 |
 
 一句话：**这些插件不需要为她的世界改任何代码**，装好就能一起用。
+
+> 有一点要提前知道：环境感知这类"每轮注入"只作用于**她回话的那一轮**。
+> 她自己发起的后台行为（决定去哪、做日程、主动搭话）不经过别的插件的
+> `on_llm_request`，那些调用看的是她自己的时间 / 位置 / 状态感知。
 
 ### 会不会影响我其它的插件和功能？
 

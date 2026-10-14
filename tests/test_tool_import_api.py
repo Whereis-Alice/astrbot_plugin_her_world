@@ -153,6 +153,21 @@ class ToolImportApiTests(unittest.TestCase):
         result = self._call({"tools": ["nope"], "dry_run": True})
         self.assertEqual(result["status_code"], 400)
 
+    def test_inactive_tool_is_hidden_and_reported(self):
+        """在 AstrBot 面板上关掉的工具（例如 helper_tools 的模块开关）不该被列出来。"""
+
+        manager = self.plugin.context.get_llm_tool_manager()
+        manager.func_list[0].active = False
+        listing = asyncio.run(self.plugin.api_tools())
+        names = [item["name"] for item in listing["data"]["tools"]]
+        self.assertNotIn("demo_search_news", names)
+        # 直接用名字调它：要说"被停用"，而不是含糊的"没有注册"
+        result = asyncio.run(
+            self.plugin.engine.tools.call_tool("demo_search_news", {})
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("停用", result.error)
+
 
 if __name__ == "__main__":
     unittest.main()

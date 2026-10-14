@@ -145,6 +145,7 @@ AstrBot 的管线轮不到跑：准备调模型前 → `on_waiting_llm_request`�
 | [meme_magpie](https://github.com/Whereis-Alice/astrbot_plugin_meme_magpie) | `on_decorating_result`（发送前贴表情包） | 补发这道钩子，并把钩子里塞进消息链的**图片一起发出去**（只捞文本会把图丢掉）；它的 `magpie_search_meme` / `magpie_send_meme` / `magpie_steal_meme` 都能一键导入成动作 |
 | [genie_tts_llm](https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm) | `on_llm_response`（把回复换成语音） | 补发这道钩子，并识别"整条回复已被换成语音"：只发语音、不再把同一句念两遍；`audio_and_text` 模式下两者都发。`genie_tts_speak` 也能导入成动作 |
 | [worldtree_lore](https://github.com/Whereis-Alice/astrbot_plugin_worldtree_lore) | `on_llm_request` / `on_waiting_llm_request` | 它写进 `system_prompt` 或 `extra_user_content_parts` 的设定会一起进她的提示词；它通过 `selected_provider` 临时指定的模型，在接管这一轮同样生效（它自己的工具也能导入成动作） |
+| [helper_tools](https://github.com/Whereis-Alice/astrbot_plugin_helper_tools) | `on_llm_request`（priority 22 起） | **环境感知**（时间 / 节假日 / 农历 / 节气 / 平台 / 群名 / 当前发言者群内资料 / Bot 自己的群身份）写进 `extra_user_content_parts`，接管时整段带进「其他插件提供的上下文」；引用媒体标注、戳一戳上下文走同一条路。老版本 AstrBot 上没有 `extra_user_content_parts` 时，这些信息会被拼在 `req.prompt` 后面——本插件按空行边界把它摘出来单独带，不会让群友"被说"节假日。它注册的 LLM 工具也能一键导入成动作；在它面板上停用的模块不会出现在可导入列表里，误调时会明确提示"被停用" |
 
 另外两个可以按需关掉的干扰点：
 
