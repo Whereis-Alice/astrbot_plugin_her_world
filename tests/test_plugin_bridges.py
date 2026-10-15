@@ -297,6 +297,35 @@ class SendExtraTests(BridgeCase):
 
 
 class RequestContextTests(BridgeCase):
+    def test_voice_only_message_is_annotated(self):
+        """纯语音消息正文是空的：要告诉她这是语音，别让她对着空白回话。"""
+
+        plugin = self._plugin()
+
+        class Record:  # 名字要和 AstrBot 的语音段一致（识别按类名走）
+            file = "voice.silk"
+
+        event = _Event()
+        event.message_obj = types.SimpleNamespace(message=[Record()], message_id="m1")
+        try:
+            text = asyncio.run(plugin._annotate_message(event, ""))
+        finally:
+            plugin.db.raw.close()
+        self.assertIn("语音", text)
+
+    def test_request_images_are_merged_into_this_turn(self):
+        """别的插件往 req.image_urls 里加的图不能丢：要和这一条消息的图一起编号。"""
+
+        plugin = self._plugin()
+        try:
+            urls, marks, _notes = asyncio.run(
+                plugin._reply_images(_Event(), [], extra=["https://img/extra.png"])
+            )
+        finally:
+            plugin.db.raw.close()
+        self.assertIn("https://img/extra.png", urls)
+        self.assertEqual(marks.get("https://img/extra.png"), "图1")
+
     def test_extra_user_content_parts_are_merged(self):
         """世界树写进 extra_user_content_parts 的设定要跟着她这一轮走。"""
 

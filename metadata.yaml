@@ -5,7 +5,7 @@ desc: >-
   会自己走动、做饭、发呆、翻旧账，也会主动找你说话；你装过的插件工具可以一键挂成"她会的手艺"。
   本仓库是 astrbot_plugin_virtual_world 的二次开发版：改名隔离、批量导入工具、工具集隔离与其它插件联动都做了加强。
 short_desc: 她自己的世界 + 一把工具：地图 / 动作 / 日程 / 记忆 / 工具批量导入
-version: v2.2.1
+version: v2.2.2
 author: Whereis-Alice
 author_url: https://github.com/Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_her_world

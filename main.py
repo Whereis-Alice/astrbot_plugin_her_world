@@ -85,9 +85,12 @@ STATE_ACTION_BUSY_TIMEOUT = 90.0
 # 「推进 tick」这一下最多等多久（秒）：这一轮里可能夹着大模型调用（刚走到新地点要就地决定、
 # 检索…），等不到就把它留在后台跑完，**绝不中途取消**——取消会把这一轮砍在半路。
 STATE_TICK_WAIT_SECONDS = 45.0
-# 钩子优先级：比默认 0 低，让其他插件先写完 system_prompt / 先决定要不要接管。
-# AstrBot 按 priority 从高到低执行钩子，并且一旦某个钩子 stop 了事件，后面的就不再执行。
-LLM_HOOK_PRIORITY = -100
+# 钩子优先级：取一个很低的数字，让我们**排在所有插件后面**。
+# AstrBot 按 priority 从高到低执行钩子，而且一旦某个钩子 stop 了事件，后面的钩子就不再执行；
+# 本插件接管时会 stop_event()，所以必须抢在最后：记忆插件、上下文插件、世界书、环境感知……
+# 这一轮往请求里写的东西都要先写完，我们再把它们一起带进她的提示词。
+# （原来的值是 -100，任何注册在 -100 以下的插件都轮不到跑，它们的上下文就这么丢了。）
+LLM_HOOK_PRIORITY = -1_000_000
 # 睡觉门禁要抢在「意图路由」这类消息级插件前面：它们通常注册在 100 左右，
 # 取值比它们高才会先执行；一旦这里 stop_event()，后面的处理器都不会跑。
 SLEEP_GUARD_PRIORITY = 200
@@ -560,7 +563,7 @@ def _is_command(text: str) -> bool:
 _ASTRBOT_PERSONA_HEAD = "# Persona Instructions"
 
 
-def _drop_persona_instructions(text: str) -> str:
+def _drop_persona_instructions(text: str, persona_text: str = "") -> str:
     """把 AstrBot 拼进来的「# Persona Instructions」那一段摘掉。
 
     AstrBot 在 `build_agent` 里就把「人格设定」追加到 ``req.system_prompt``
@@ -569,20 +572,38 @@ def _drop_persona_instructions(text: str) -> str:
     「其他插件提供的上下文」那一节还会把 AstrBot 那份原样念给她听。
 
     其余插件写进 system_prompt 的内容（上下文理解、记忆…）原样保留。
+
+    ``persona_text`` 是宿主这一轮真正写进去的那份人设原文（拿得到就给，见
+    ``HerWorldPlugin._host_persona_prompt``）。有它就按原文精确摘掉——这一步很关键：
+    人设块后面经常紧跟着别的插件写的内容（世界树的 ``<worldtree_persona>``、
+    有的插件直接拼一段正文），按"摘到下一个一级标题"去猜会把那些内容一起吞掉。
     """
 
     body = str(text or "")
     index = body.find(_ASTRBOT_PERSONA_HEAD)
     if index < 0:
         return body.strip()
+    needle = str(persona_text or "").strip()
+    if needle:
+        found = body.find(needle, index + len(_ASTRBOT_PERSONA_HEAD))
+        if found >= 0:
+            end = found + len(needle)
+            # 只吃掉人设块自己的换行，后面紧跟的内容一个字都不动
+            while end < len(body) and body[end] == "\n":
+                end += 1
+            head = body[:index].rstrip()
+            rest = body[end:].lstrip()
+            return f"{head}\n\n{rest}".strip() if rest else head
     head = body[:index].rstrip()
-    tail = body[index + len(_ASTRBOT_PERSONA_HEAD) :]
-    # 人设那一段一直写到下一个一级标题（`# xxx`）为止
-    stop = None
+    tail = body[index + len(_ASTRBOT_PERSONA_HEAD):]
+    # 退而求其次：人设那一段一直写到下一个一级标题（`# xxx`）为止
     match = re.search(r"(?m)^#\s", tail)
-    if match:
-        stop = match.start()
-    rest = tail[stop:] if stop is not None else ""
+    if not match:
+        # 找不到下一个一级标题时**不猜**：以前这里会一路删到结尾，
+        # 结果是把紧跟人设后面的插件内容（没有小标题的那种）一起吞了。
+        # 宁可人设多出现一次，也不能丢别人的上下文。
+        return body.strip()
+    rest = tail[match.start():]
     return (head + "\n" + rest.lstrip("\n")).strip()
 
 
@@ -656,6 +677,16 @@ def _selected_provider_extra(event: Any) -> str:
     except Exception:
         return ""
     return str(raw or "").strip()
+
+
+def _has_voice_component(event: Any) -> bool:
+    """这条消息里有没有语音段（Record/Voice）。"""
+
+    message_obj = getattr(event, "message_obj", None)
+    for component in list(getattr(message_obj, "message", []) or []):
+        if type(component).__name__ in ("Record", "Voice"):
+            return True
+    return False
 
 
 def _is_command_event(event: Any) -> bool:
@@ -3100,7 +3131,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Whereis-Alice（原版 exneverbur）",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.2.1",
+    "v2.2.2",
 )
 class HerWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -3284,6 +3315,53 @@ class HerWorldPlugin(Star):
         """这一轮里别的插件临时指定的模型 id（没有就返回空串）。"""
 
         return str(self._turn_provider_overrides.get(str(session_id or ""), "") or "").strip()
+
+    async def _host_persona_prompt(self, event: Any, req: Any, session_id: str) -> str:
+        """宿主这一轮真正写进 ``system_prompt`` 的那份人设原文。
+
+        拿它的唯一用途是"精确摘掉"：宿主把人格拼成 ``# Persona Instructions`` 一段，
+        而别的插件（世界树、有的记忆插件）经常紧跟着往同一个字段里追加内容。
+        只有知道人设原文到哪儿结束，才能只摘人设、不误伤别人。
+
+        拿不到就返回空串，调用方会退回原来的启发式。
+        """
+
+        manager = getattr(self.context, "persona_manager", None)
+        if manager is None:
+            return ""
+        resolver = getattr(manager, "resolve_selected_persona", None)
+        if callable(resolver):
+            try:
+                settings: Any = None
+                config_getter = getattr(self.context, "get_config", None)
+                if callable(config_getter):
+                    raw_config = config_getter() or {}
+                    if isinstance(raw_config, dict):
+                        settings = raw_config.get("provider_settings")
+                platform = ""
+                platform_getter = getattr(event, "get_platform_name", None)
+                if callable(platform_getter):
+                    platform = str(platform_getter() or "")
+                conversation = getattr(req, "conversation", None)
+                _persona_id, persona, _forced, _webchat = await resolver(
+                    umo=session_id,
+                    conversation_persona_id=getattr(conversation, "persona_id", None),
+                    platform_name=platform,
+                    provider_settings=settings,
+                )
+                if isinstance(persona, dict):
+                    text = str(persona.get("prompt") or "").strip()
+                else:
+                    text = str(getattr(persona, "prompt", "") or "").strip()
+                if text:
+                    return text
+            except Exception:
+                pass
+        # 退路：插件自己那份「AstrBot 给这个会话的人格」解析
+        try:
+            return await self.persona_port.astrbot_persona_text(session_id)
+        except Exception:
+            return ""
 
     async def terminate(self) -> None:
         # 宿主重载插件时是「先调 terminate()，再解绑事件处理器」，
@@ -3526,6 +3604,10 @@ class HerWorldPlugin(Star):
                 event, text, sources=sources, labels=image_labels
             )
         )
+        if not str(text or "").strip() and _has_voice_component(event):
+            # 纯语音消息：正文是空的，不说明一下她会以为自己收到了一条空白消息。
+            # 内容转写要靠 AstrBot 那边装语音转文字的能力，这里只把"发生了什么"讲清楚。
+            notes.append("这是一段语音消息，你听不到里面的内容")
         if not notes:
             return text
         return f"{text}\n［{'；'.join(notes)}］".strip()
@@ -3698,7 +3780,10 @@ class HerWorldPlugin(Star):
         return await self._caption_old_images(event, older, sources=sources)
 
     async def _reply_images(
-        self, event: AstrMessageEvent, sources: list[str]
+        self,
+        event: AstrMessageEvent,
+        sources: list[str],
+        extra: list[str] | None = None,
     ) -> tuple[list[str], dict[str, str], list[str]]:
         """这一轮直接交给模型看的图、它们的编号（``图1``/``图2``…），以及要转成文字的那几张。
 
@@ -3713,6 +3798,10 @@ class HerWorldPlugin(Star):
           ``engine.attach_image_captions`` 与 ``prompt._render_rows``）。
 
         转述只发生一次：本来就要交给主模型看的图不会再转述一遍（白花钱）。
+
+        ``extra`` 是别的插件往这一轮请求里加的图（``req.image_urls``）：和这一条消息
+        自己带的图一样对待，去重之后一起编号——那是别人已经认可的"要给模型看"的图，
+        丢掉就等于这一轮少看了一张。
         """
 
         session_id = event.unified_msg_origin
@@ -3726,7 +3815,11 @@ class HerWorldPlugin(Star):
         # 按时间排好（先来的在前）：被搭话的那几条消息里的图排前面，最新那张在最后
         own = list(
             dict.fromkeys(
-                [str(ref).strip() for ref in [*pending, *sources] if str(ref).strip()]
+                [
+                    str(ref).strip()
+                    for ref in [*pending, *sources, *list(extra or [])]
+                    if str(ref).strip()
+                ]
             )
         )
         # 「发送范围里」的图 = 这次真的会进提示词的聊天记录里的图（被压成概览的早就不在这里了，
@@ -4049,6 +4142,10 @@ class HerWorldPlugin(Star):
         if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
             return
 
+        # 宿主这一轮写进 system_prompt 的人设原文：拿它精确摘掉人设块，
+        # 才不会误伤紧跟其后的其它插件内容（世界树的 <worldtree_persona> 正好紧跟在这后面）
+        host_persona_prompt = await self._host_persona_prompt(event, req, session_id)
+
         # `req.prompt` 是管线处理过的用户消息（可能已带上图片描述等），优先用它
         user_text = (getattr(req, "prompt", "") or "").strip() or (
             event.get_message_str() or ""
@@ -4067,7 +4164,11 @@ class HerWorldPlugin(Star):
         sources = await _image_sources(event)
         # 先决定"这一轮把哪几张图交给主模型看"（编号也在这儿定），
         # 再拼注解——这样注解里的"就是图2、图3"和聊天记录里的编号是同一套
-        image_urls, image_marks, image_notes = await self._reply_images(event, sources)
+        # `req.image_urls` 里可能还有别的插件加进来的图（引用图片提取、视觉插件…）：
+        # 一起算进去，否则那些图在她这一轮会凭空消失
+        image_urls, image_marks, image_notes = await self._reply_images(
+            event, sources, extra=list(getattr(req, "image_urls", None) or [])
+        )
         user_text = await self._annotate_message(
             event,
             user_text,
@@ -4097,7 +4198,9 @@ class HerWorldPlugin(Star):
             # 临时正文（世界树的设定走这条）也一起带上
             other_context=_merged_request_context(
                 req,
-                _drop_persona_instructions(getattr(req, "system_prompt", "") or ""),
+                _drop_persona_instructions(
+                    getattr(req, "system_prompt", "") or "", host_persona_prompt
+                ),
                 prompt_injection,
             ),
             image_urls=image_urls,

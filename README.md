@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v2.2.1-4f6bf5" alt="version" />
+  <img src="https://img.shields.io/badge/version-v2.2.2-4f6bf5" alt="version" />
   <img src="https://img.shields.io/badge/AstrBot-%E2%89%A5%204.20.0-8b6cf0" alt="AstrBot" />
   <img src="https://img.shields.io/badge/dependencies-%E6%97%A0-brightgreen" alt="dependencies" />
 </p>
@@ -110,9 +110,25 @@
 
 一句话：**这些插件不需要为她的世界改任何代码**，装好就能一起用。
 
-> 有一点要提前知道：环境感知这类"每轮注入"只作用于**她回话的那一轮**。
-> 她自己发起的后台行为（决定去哪、做日程、主动搭话）不经过别的插件的
-> `on_llm_request`，那些调用看的是她自己的时间 / 位置 / 状态感知。
+### 别的插件给的上下文，会怎么进她的提示词
+
+她接管回复时是自己拼提示词、自己发请求的，所以下面这些通道都做了显式对接（记忆插件、
+上下文插件、世界书、环境感知都用得上）。**接管时会故意排在所有插件后面**，
+就是为了让它们先写完、我们再一起带走：
+
+| 别的插件从哪儿写 | 她这一轮会看到什么 |
+| --- | --- |
+| `req.system_prompt` | 原样进「其他插件提供的上下文」。AstrBot 自己的「人格设定」块会被**精确**摘掉（她的人设由插件这边给），紧跟其后的插件内容不会跟着被删 |
+| `req.extra_user_content_parts` | 同上（世界树的设定、helper_tools 的环境感知走这条） |
+| `req.contexts`（宿主的对话历史） | 原样作为 `contexts` 传给她这一轮的主模型调用 |
+| `req.prompt` 尾巴上拼的临时信息 | `[环境感知]` 这类按边界摘出来单独带，正文保持干净（老版本 AstrBot 的降级路径） |
+| `req.image_urls` | 和这一条消息自己带的图一起去重、一起编号，不会少看一张 |
+| `event.set_extra(...)` | 认明确约定的键：意图路由的事前判定、世界树的临时模型 |
+| 别的插件先 `stop_event()` | 她直接不接管，那条消息按对方的意思走 |
+
+两个边界要说清：她自己的后台行为（决定去哪、走日程、主动搭话）不经过别的插件的
+`on_llm_request`，那些调用用的是她自己提示词里的时间 / 位置 / 状态；
+语音消息目前只会在记录里标一句「这是一段语音消息」，内容转写要靠 AstrBot 那边装语音转文字。
 
 ### 会不会影响我其它的插件和功能？
 

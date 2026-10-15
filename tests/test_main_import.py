@@ -2243,6 +2243,47 @@ class TestMainImport(unittest.TestCase):
             "只有别的插件写的东西",
         )
 
+    def test_persona_strip_keeps_plugin_block_right_after_it(self):
+        """人设块后面紧跟的插件内容（没有小标题的那种）不能被一起吃掉。
+
+        世界树的人设注入是 ``<worldtree_persona>…</worldtree_persona>``，
+        它紧跟在宿主的人设块后面、不带一级标题；知道人设原文时应当只摘人设那一段。
+        """
+
+        module = self.module
+        raw = (
+            "你是群里的助手。\n"
+            "# Persona Instructions\n\n"
+            "你是小助手，说话可爱一点。\n"
+            "<worldtree_persona>\n"
+            "以下是本轮回复应当扮演的角色设定。\n"
+            "</worldtree_persona>"
+        )
+        out = module._drop_persona_instructions(raw, "你是小助手，说话可爱一点。")
+        self.assertNotIn("你是小助手", out)
+        self.assertIn("<worldtree_persona>", out)
+        self.assertIn("以下是本轮回复应当扮演的角色设定", out)
+        # 人设前面别的内容照旧保留
+        self.assertIn("你是群里的助手", out)
+
+    def test_persona_strip_without_known_text_keeps_tail(self):
+        """拿不到人设原文、后面又没有小标题时：宁可多留一段，也不吞别人的内容。"""
+
+        module = self.module
+        raw = "# Persona Instructions\n\n人设正文\n插件直接拼的一段正文"
+        out = module._drop_persona_instructions(raw)
+        self.assertIn("插件直接拼的一段正文", out)
+
+    def test_takeover_hook_runs_after_other_plugins(self):
+        """接管钩子的优先级必须足够低：否则注册在更后面的插件会连跑都跑不到。
+
+        AstrBot 按 priority 从高到低执行 `on_llm_request`，而且一旦某个钩子
+        stop 了事件，后面的钩子就不再执行——本插件接管时会 stop_event，
+        所以它的优先级必须比所有"往请求里写上下文"的插件都低。
+        """
+
+        self.assertLessEqual(self.module.LLM_HOOK_PRIORITY, -100000)
+
     def test_nickname_edit_covers_the_group_chats_only(self):
         """改名片写的是「她这一组里的群」：别的会话组一个字都不碰。"""
 
