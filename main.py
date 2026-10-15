@@ -2643,8 +2643,9 @@ class AstrBotTools:
                     continue
                 tool = candidate
                 break
-        if tool is None:
-            inactive = any(
+        # get_func() 可能返回停用对象，包括不在 func_list 里的内置工具。
+        if tool is None or not bool(getattr(tool, "active", True)):
+            inactive = tool is not None or any(
                 getattr(candidate, "name", "") == name
                 and not bool(getattr(candidate, "active", True))
                 for candidate in list(getattr(manager, "func_list", []) or [])
@@ -3131,7 +3132,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Whereis-Alice（原版 exneverbur）",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.2.2",
+    "v2.2.3",
 )
 class HerWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -6813,7 +6814,8 @@ class HerWorldPlugin(Star):
         catalog = self._tool_catalog()
         if not catalog:
             return error_response(
-                "现在拿不到 AstrBot 的工具列表（插件刚启动或工具还没加载完），稍后再试"
+                "AstrBot 现在没有可导入的已启用工具：可能还没加载完，"
+                "也可能工具或提供工具的插件已被停用"
             )
         raw = payload.get("tools")
         if isinstance(raw, list) and raw:
@@ -6827,7 +6829,12 @@ class HerWorldPlugin(Star):
         missing = [name for name in names if name not in catalog]
         tools = [catalog[name] for name in names if name in catalog]
         if not tools:
-            return error_response("没有可导入的工具（选中的工具可能已经卸载了）")
+            shown = "、".join(missing[:6]) + ("…" if len(missing) > 6 else "")
+            return error_response(
+                f"这些工具现在不可用（未注册或已停用）：{shown}"
+                if missing
+                else "没有可导入的工具"
+            )
 
         options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
         options = dict(options)
@@ -6840,7 +6847,7 @@ class HerWorldPlugin(Star):
         notes: list[str] = []
         if missing:
             shown = "、".join(missing[:6]) + ("…" if len(missing) > 6 else "")
-            notes.append(f"这些工具现在没注册，已跳过：{shown}")
+            notes.append(f"这些工具现在不可用（没注册或已停用），已跳过：{shown}")
         want_model = bool(options.pop("use_model", False)) or str(options.get("naming")) == "llm"
         if want_model:
             plans, plan_note = await self._plan_action_names(tools)

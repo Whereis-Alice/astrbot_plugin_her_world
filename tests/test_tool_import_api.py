@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import Mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_DIR = os.path.dirname(HERE)
@@ -152,6 +153,7 @@ class ToolImportApiTests(unittest.TestCase):
     def test_unknown_tool_is_reported(self):
         result = self._call({"tools": ["nope"], "dry_run": True})
         self.assertEqual(result["status_code"], 400)
+        self.assertIn("nope", result["message"])
 
     def test_inactive_tool_is_hidden_and_reported(self):
         """在 AstrBot 面板上关掉的工具（例如 helper_tools 的模块开关）不该被列出来。"""
@@ -167,6 +169,94 @@ class ToolImportApiTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertIn("停用", result.error)
+
+    def test_import_all_excludes_inactive_tools(self):
+        manager = self.plugin.context.get_llm_tool_manager()
+        manager.func_list[0].active = False
+        manager.func_list.append(fake_tool("demo_weather", "查询天气。"))
+        result = self._call({"tools": "all", "dry_run": False})
+        self.assertEqual(result["data"]["created"], 1)
+        self.assertEqual(
+            [
+                item["id"]
+                for item in self.plugin.store.raw_world().get("actions", [])
+                if item["id"].startswith("tool_")
+            ],
+            ["tool_demo_weather"],
+        )
+
+    def test_explicit_selection_cannot_import_inactive_tool(self):
+        manager = self.plugin.context.get_llm_tool_manager()
+        manager.func_list[0].active = False
+        result = self._call({"tools": ["demo_search_news"], "dry_run": False})
+        self.assertEqual(result["status_code"], 400)
+        self.assertIn("demo_search_news", result["message"])
+        self.assertNotIn(
+            "tool_demo_search_news",
+            [item["id"] for item in self.plugin.store.raw_world().get("actions", [])],
+        )
+
+    def test_get_func_cannot_bypass_inactive_check(self):
+        manager = self.plugin.context.get_llm_tool_manager()
+        tool = manager.func_list[0]
+        tool.active = False
+        tool.handler = Mock()
+        manager.get_func = lambda name: tool
+        result = asyncio.run(self.plugin.engine.tools.call_tool(tool.name, {}))
+        self.assertFalse(result.ok)
+        self.assertIn("停用", result.error)
+        tool.handler.assert_not_called()
+
+    def test_inactive_builtin_from_get_func_is_rejected(self):
+        manager = self.plugin.context.get_llm_tool_manager()
+        tool = fake_tool("builtin_search", "搜索。")
+        tool.active = False
+        manager.get_func = lambda name: tool
+        manager.iter_builtin_tools = lambda: [tool]
+        listing = asyncio.run(self.plugin.api_tools())
+        self.assertNotIn(tool.name, [item["name"] for item in listing["data"]["tools"]])
+        result = asyncio.run(self.plugin.engine.tools.call_tool(tool.name, {}))
+        self.assertFalse(result.ok)
+        self.assertIn("停用", result.error)
+
+    def test_tools_of_unloaded_plugin_are_gone(self):
+        """模拟 AstrBot 卸载插件时从管理器移除工具。"""
+
+        manager = self.plugin.context.get_llm_tool_manager()
+        # AstrBot 卸载插件时做的事：把它注册的工具从 func_list 里移掉
+        manager.func_list = []
+        listing = asyncio.run(self.plugin.api_tools())
+        self.assertEqual(listing["data"]["tools"], [])
+        result = self._call({"tools": ["demo_search_news"], "dry_run": True})
+        self.assertEqual(result["status_code"], 400)
+        self.assertIn("没有可导入的已启用工具", result["message"])
+
+    def test_unload_preserves_existing_action_but_tool_is_unavailable(self):
+        self._call({"tools": ["demo_search_news"], "dry_run": False})
+        self.plugin.context.get_llm_tool_manager().func_list = []
+        self.assertIn(
+            "tool_demo_search_news",
+            [item["id"] for item in self.plugin.store.raw_world().get("actions", [])],
+        )
+        result = asyncio.run(self.plugin.engine.tools.call_tool("demo_search_news", {}))
+        self.assertFalse(result.ok)
+        self.assertIn("没有注册", result.error)
+
+    def test_partly_unloaded_selection_still_imports_the_rest(self):
+        """选了一批工具，其中一部分的插件刚被停用：能导的照常导，并说明漏了谁。"""
+
+        manager = self.plugin.context.get_llm_tool_manager()
+        manager.func_list = [
+            candidate
+            for candidate in manager.func_list
+            if candidate.name != "demo_send_message"
+        ]
+        result = self._call(
+            {"tools": ["demo_search_news", "demo_send_message"], "dry_run": True}
+        )
+        data = result["data"]
+        self.assertEqual([item["id"] for item in data["drafts"]], ["tool_demo_search_news"])
+        self.assertTrue(any("没注册" in item for item in data["warnings"]))
 
 
 if __name__ == "__main__":
