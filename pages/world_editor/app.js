@@ -6140,6 +6140,11 @@ async function refreshStatus() {
     renderValueRows(values, data);
 
     // 群名片：直接改、锁定/解锁、恢复原名
+    const nicknameOwner = String(data.nickname_owner || "");
+    $("status-nickname-owner").textContent = nicknameOwner ? `由${nicknameOwner}管理` : "";
+    ["status-nickname", "status-nickname-save", "status-nickname-reset"].forEach((id) => {
+      $(id).disabled = Boolean(nicknameOwner);
+    });
     const nicknameBox = $("status-nickname");
     if (nicknameBox) {
       nicknameBox.value = data.nickname || "";
@@ -9214,9 +9219,17 @@ function renderActionMenu() {
   box.appendChild(actionMenuItem("", "全部", originals.length));
   Array.from(counts.keys())
     .sort()
-    .forEach((group) =>
-      box.appendChild(actionMenuItem(`group:${group}`, group, counts.get(group))),
-    );
+    .forEach((group) => {
+      const row = el("div", "action-menu-row");
+      row.appendChild(actionMenuItem(`group:${group}`, group, counts.get(group)));
+      const rename = el("button", "action-group-rename", "✎");
+      rename.type = "button";
+      rename.title = `重命名分组：${group}`;
+      rename.setAttribute("aria-label", `重命名分组：${group}`);
+      rename.addEventListener("click", () => renameActionGroup(group));
+      row.appendChild(rename);
+      box.appendChild(row);
+    });
 
   const extensions = (ui.config && ui.config.extension_actions) || [];
   const extItems = extensions
@@ -9247,6 +9260,36 @@ function actionMenuItem(key, label, count) {
     renderActionGrid();
   });
   return button;
+}
+
+function renameActionGroup(group) {
+  openFormDialog({
+    title: "重命名动作分组",
+    values: { name: group },
+    fields: [
+      { key: "name", label: "分组名称" },
+      { key: "merge", label: "同名时合并分组", type: "checkbox" },
+    ],
+    onSubmit: (values) => {
+      const name = String(values.name || "").trim();
+      if (!name) throw new Error("分组名称不能为空");
+      if (name.length > 80) throw new Error("分组名称不能超过 80 个字符");
+      if (name === group) return true;
+      const originals = actions().filter((action) => !actionOwnerOf(action));
+      if (!values.merge && originals.some((action) => groupOfAction(action) === name)) {
+        throw new Error("已有同名分组；勾选「同名时合并分组」后再确定");
+      }
+      const members = originals.filter((action) => groupOfAction(action) === group);
+      if (!members.length) throw new Error("这个分组已不存在，请重新选择");
+      members.forEach((action) => { action.group = name; });
+      if (ui.actionGroup === `group:${group}`) ui.actionGroup = `group:${name}`;
+      if (ui.actionCollapsed.delete(group)) ui.actionCollapsed.add(name);
+      markDirty();
+      renderActionGrid();
+      toast(`已将「${group}」重命名为「${name}」，共 ${members.length} 个动作；保存后生效`);
+      return true;
+    },
+  });
 }
 
 /** 动作排序：内置永远在最前，其余按用户选的档位。 */

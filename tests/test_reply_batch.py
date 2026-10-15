@@ -616,6 +616,28 @@ class ReplyBatchTest(unittest.IsolatedAsyncioTestCase):
 
     # ---------------- 7：群 / 私聊互为背景但不互相合并 ----------------
 
+    async def test_live_answer_is_not_released_when_a_message_arrives_during_actions(self):
+        self.merge_mode(interrupt=True)
+        trigger = self.register("第一句", message_id="sent1")
+        late = {}
+        original = self.engine._execute_actions
+
+        async def send_then_receive(state, node, outcome, actions, **kwargs):
+            outcome.live_messages.append("在，怎么了？")
+            late["record"] = self.register("新的问题", message_id="sent2")
+
+        self.engine._execute_actions = send_then_receive
+        try:
+            reply = await self.engine.handle_reply(self.ctx("第一句", message_id="sent1"))
+        finally:
+            self.engine._execute_actions = original
+        self.assertTrue(reply.ok, reply.error)
+        self.assertEqual(reply.live_messages, ["在，怎么了？"])
+        self.assertTrue(self.engine.was_absorbed(trigger))
+        self.assertFalse(self.engine.was_absorbed(late["record"]))
+        self.assertFalse(late["record"].get("picked"))
+        self.assertEqual(len(self.llm.calls), 1)
+
     async def test_a_private_message_is_not_merged_into_the_group_round(self):
         """同一个"她"的群和私聊共用待回队列，但来源约束不丢。"""
 

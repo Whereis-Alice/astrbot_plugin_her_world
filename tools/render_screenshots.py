@@ -8,7 +8,7 @@
 
     python tools/render_screenshots.py docs/images
 
-跑完会覆盖 ``actions-manage.png`` 与 ``actions-import.png`` 两张图。
+生成动作管理、工具导入、分组改名截图，并验证改名保存和桌面 / 手机弹窗边界。
 """
 
 from __future__ import annotations
@@ -256,11 +256,14 @@ BRIDGE_JS = r"""
     offContextChange: () => {},
     apiGet: async (endpoint) => {
       const key = String(endpoint || "").replace(/^\/+/, "");
-      if (Object.prototype.hasOwnProperty.call(table, key)) return table[key];
+      if (Object.prototype.hasOwnProperty.call(table, key)) return structuredClone(table[key]);
       return {};
     },
-    apiPost: async (endpoint) => {
+    apiPost: async (endpoint, data) => {
       const key = String(endpoint || "").replace(/^\/+/, "");
+      if (key === "config/world") table.config.world = structuredClone(data.world);
+      if (key === "config/schedules") table.config.schedules = structuredClone(data.schedules);
+      if (key === "config/sessions") table.config.sessions = structuredClone(data.sessions);
       if (Object.prototype.hasOwnProperty.call(table, key)) return table[key];
       if (key === "tools/import") return { ok: true, dry_run: true, drafts: [], warnings: [] };
       return { ok: true };
@@ -333,6 +336,9 @@ def main() -> None:
             )
             context.add_init_script(script=script)
             page = context.new_page()
+            page.emulate_media(reduced_motion="reduce")
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(url, wait_until="load")
             frame = page.frame_locator("#harness")
             frame.locator("#app").wait_for(state="visible", timeout=30000)
@@ -350,6 +356,41 @@ def main() -> None:
                 path=str(out_dir / "actions-import.png")
             )
             print("wrote", out_dir / "actions-import.png")
+            frame.locator("#import-close").click()
+            rename = frame.get_by_role("button", name="重命名分组：官方工具", exact=True)
+            rename.click()
+            frame.locator('[data-dialog-key="name"]').fill("常用查询")
+            frame.locator("#dialog-card").screenshot(path=str(out_dir / "actions-rename.png"))
+            frame.locator("#dialog-ok").click()
+            renamed = frame.get_by_role("button", name="重命名分组：常用查询", exact=True)
+            renamed.wait_for(state="visible")
+            frame.locator("#save").click()
+            child = page.frames[1]
+            child.wait_for_function("async () => (await window.AstrBotPluginPage.apiGet('config')).world.actions.some(a => a.group === '常用查询')")
+            saved = child.evaluate("async () => (await window.AstrBotPluginPage.apiGet('config')).world")
+            assert any(action.get("group") == "常用查询" for action in saved["actions"])
+            assert not any(action.get("group") == "官方工具" for action in saved["actions"])
+            rename_count = renamed.count()
+            renamed.click()
+            frame.locator('[data-dialog-key="name"]').fill("常用查询")
+            frame.locator("#dialog-ok").click()
+            assert renamed.count() == rename_count
+            print("verified group rename and persisted save")
+
+            for width, height in ((1280, 800), (390, 844)):
+                page.set_viewport_size({"width": width, "height": height})
+                page.locator("#harness").evaluate(
+                    "(node, size) => {node.style.width=size.width+'px';node.style.height=size.height+'px';}",
+                    {"width": width, "height": height},
+                )
+                frame.get_by_role("button", name="重命名分组：常用查询", exact=True).click()
+                dialog = frame.locator("#dialog-card")
+                box = dialog.bounding_box()
+                assert box and box["x"] >= 0 and box["x"] + box["width"] <= width + 1
+                page.screenshot(path=str(out_dir / f"actions-rename-{width}.png"))
+                frame.locator("#dialog-cancel").click()
+            print("verified desktop/mobile rename dialog bounds")
+            assert not errors, errors
             browser.close()
     finally:
         server.shutdown()

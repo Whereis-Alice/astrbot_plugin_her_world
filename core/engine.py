@@ -7737,7 +7737,7 @@ class HerWorldEngine:
             )
             # 「只要还没发出去就能打断」：动作这一段可能花很久，期间来的新消息
             # 仍然可以把这一轮作废——注意这时她的话还没写进留档、更没发出去。
-            if restarts < MERGE_MAX_RESTARTS:
+            if restarts < MERGE_MAX_RESTARTS and not outcome.live_messages:
                 late = self._take_merge_texts(
                     ctx.session_id,
                     phase3_started,
@@ -11710,7 +11710,7 @@ class HerWorldEngine:
         action: dict[str, Any],
         *,
         depth: int = 0,
-    ) -> None:
+    ) -> bool:
         action_id = str(action.get("type", ""))
         definition = self.world.action_map().get(action_id)
 
@@ -11903,6 +11903,7 @@ class HerWorldEngine:
             and not tool_failed
             and detail
             and is_tool_action
+            and not action.get("reply_planned")
             and bool(self.world.tool_result_reply)
         ):
             # 工具型动作拿到结果后，默认交回主模型说一句（可以用全局设置关掉）
@@ -11912,6 +11913,7 @@ class HerWorldEngine:
             # 事件里"先去做点什么"那一轮：结果只交回给她判断，不往群里说
             want_followup = False
             outcome.notes.append(f"动作 {action_id} 的结果只用于事件判断，不作续说")
+        followup_spoke = False
         if want_followup and self.llm is not None:
             if not detail:
                 # 不是工具动作（做饭、看书…）也要能续说：给她一句"刚刚做了什么"的交代
@@ -11921,7 +11923,7 @@ class HerWorldEngine:
                 label = definition.name or definition.id if definition else ""
                 detail = f"你刚刚做完了「{label}」，用了大约 {minutes} 分钟。"
             detail = self._clip_followup(detail)
-            await self._llm_followup(
+            followup_spoke = await self._llm_followup(
                 state,
                 node,
                 outcome,
@@ -11940,6 +11942,7 @@ class HerWorldEngine:
 
         if action_home:
             outcome.speech_home = previous_home
+        return followup_spoke
 
     async def _remember_external_state(
         self,
@@ -12085,7 +12088,7 @@ class HerWorldEngine:
         depth: int = 1,
         after_search: bool = False,
         definition: Any = None,
-    ) -> None:
+    ) -> bool:
         persona_text = await self._persona_text(state.session_id)
         _cell, say_limit, style_text = self.style_for(state, state.session_id)
         blocked_actions = self._hidden_actions(state)
@@ -12140,7 +12143,7 @@ class HerWorldEngine:
         )
         outcome.llm_calls += 1
         if reply is None:
-            return
+            return False
         result = parse_action_payload(
             reply,
             available_actions=self._parseable_action_ids(
@@ -12172,9 +12175,11 @@ class HerWorldEngine:
                 },
                 outcome=outcome,
             )
+        before = len(outcome.said_messages())
         await self._execute_actions(
             state, node, outcome, actions, depth=depth, autonomous=True
         )
+        return len(outcome.said_messages()) > before
 
     def _note_action_state_slot(
         self, state: WorldState, definition: Any, said: list[str]
@@ -13043,6 +13048,7 @@ class HerWorldEngine:
         # 这一批里有没有动作把她的"手头那件事"换掉：只有那种情况才需要排队——
         # 她原来就在做的事不该拦住"说一句话"这种瞬时动作，否则对方等的是几分钟后的回话
         started_here = False
+        tool_answered = False
         for index, action in enumerate(queued_actions):
             definition = self.world.action_map().get(action.type)
             if definition is None:
@@ -13060,6 +13066,12 @@ class HerWorldEngine:
                     },
                     outcome=outcome,
                 )
+                continue
+            if (
+                tool_answered and action.type == "say"
+                and self._speech_target(state, action, outcome) == outcome.home()
+            ):
+                outcome.notes.append("工具续写已回应本轮，跳过工具执行前预写的回答")
                 continue
             if (
                 definition.id in self.DEDUPE_ACTION_IDS
@@ -13203,7 +13215,7 @@ class HerWorldEngine:
                     state.session_id, action.target, now=self._now()
                 )
             before_action = state.current_action
-            await self._start_action(
+            answered = await self._start_action(
                 state,
                 node,
                 outcome,
@@ -13213,7 +13225,17 @@ class HerWorldEngine:
                 autonomous,
                 from_plan=from_plan,
                 skip_drowsy=skip_drowsy,
+                # 工具后面已有当前会话的台词，不再额外触发默认续写；
+                # 工具前的「等我查一下」不算结果回答。
+                reply_planned=any(
+                    item.type == "say" and bool(item.messages)
+                    and self.world.action_map().get("say") is not None
+                    and self.world.action_map()["say"].available_in(state.node_id)
+                    and self._speech_target(state, item, outcome) == outcome.home()
+                    for item in queued_actions[index + 1 :]
+                ),
             )
+            tool_answered = tool_answered or bool(answered)
             if state.current_action is not before_action:
                 # 她手头换成了这一批里的动作：后面的才需要排队等它做完
                 started_here = True
@@ -16084,7 +16106,8 @@ class HerWorldEngine:
         *,
         from_plan: bool = False,
         skip_drowsy: bool = False,
-    ) -> None:
+        reply_planned: bool = False,
+    ) -> bool | None:
         # 这里是所有动作真正开始执行的唯一入口（计划 / 日程 / 自主行为 / 工具后续都走这里），
         # 因此把「能不能做」的校验统一放在这里，避免某条路径绕过检查。
         blocked = self._extension_gate(definition, state)
@@ -16332,12 +16355,13 @@ class HerWorldEngine:
                 "duration_ticks": 0,
                 "from_plan": False,
                 "desc": definition.name or definition.id,
+                "reply_planned": reply_planned,
             }
-            await self._finish_action(state, node, outcome, payload)
+            answered = await self._finish_action(state, node, outcome, payload)
             if from_plan and state.current_plan is not None:
                 advance(state)
                 await self._tick_plan(state, node, outcome, depth=depth + 1)
-            return
+            return answered
 
         messages = await self._instant_output(
             state, node, definition, action, session_id=outcome.home()
@@ -18416,6 +18440,9 @@ class HerWorldEngine:
             for item in self.group_sessions(state.session_id)
             if ":GroupMessage:" in str(item) and self.is_enabled(str(item))
         ]
+        owner = getattr(self.messenger, "group_card_owner", None)
+        if callable(owner):
+            targets = [target for target in targets if not owner(target)]
         if not targets:
             return
         primary = targets[0]

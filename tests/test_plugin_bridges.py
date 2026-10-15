@@ -183,9 +183,21 @@ class BridgeCase(unittest.TestCase):
         # 桥接里判断 Plain 用的是模块里那份，换成本文件的替身
         self._plain = self.module.Plain
         self.module.Plain = _Plain
+        self._hook_module_names = (
+            "astrbot.core", "astrbot.core.pipeline", "astrbot.core.pipeline.context_utils",
+            "astrbot.core.provider", "astrbot.core.provider.entities", "astrbot.core.star",
+            "astrbot.core.star.star_handler", "astrbot.core.message",
+            "astrbot.core.message.message_event_result",
+        )
+        self._hook_modules = {name: sys.modules.get(name) for name in self._hook_module_names}
 
     def tearDown(self) -> None:
         self.module.Plain = self._plain
+        for name, module in self._hook_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
     def _plugin(self):
         return self.module.HerWorldPlugin(
@@ -195,6 +207,46 @@ class BridgeCase(unittest.TestCase):
 
 
 class ReplyChainTests(BridgeCase):
+    def test_external_card_owner_also_blocks_direct_card_writes(self):
+        plugin = self._plugin()
+        plugin.context.get_all_stars = lambda: [types.SimpleNamespace(
+            name="astrbot_plugin_dynamic_card_plus", activated=True,
+            star_cls=types.SimpleNamespace(config={}),
+        )]
+        try:
+            result = asyncio.run(plugin.messenger.set_group_card("aiocqhttp:GroupMessage:1", "不应覆盖"))
+        finally:
+            plugin.db.raw.close()
+        self.assertFalse(result.ok)
+        self.assertIn("灵动名片", result.reason)
+
+    def test_failed_decorating_hook_restores_the_original_event_result(self):
+        plugin = self._plugin()
+        event = _Event()
+        original = _Result().message("原结果")
+        event.set_result(original)
+
+        async def fail(_event):
+            raise RuntimeError("test hook failure")
+
+        install_hook_stubs(on_decorating=fail)
+        try:
+            messages, extra = asyncio.run(plugin._bridge_reply_hooks(event, ["在呢"]))
+        finally:
+            plugin.db.raw.close()
+        self.assertIs(event.get_result(), original)
+        self.assertEqual(messages, ["在呢"])
+
+    def test_debug_echo_keeps_the_rewritten_text(self):
+        from core.engine import TickOutcome
+
+        plugin = self._plugin()
+        try:
+            outcome = TickOutcome(session_id="s", messages=["原文"], debug_positions=[0])
+            self.assertEqual(plugin._merge_with_echo(["改写后"], outcome, ["工具回显"]), ["工具回显", "改写后"])
+        finally:
+            plugin.db.raw.close()
+
     def test_meme_image_from_decorating_hook_is_kept(self):
         """表情包插件在发送前钩子里塞的图不能被吞掉。"""
 
@@ -443,6 +495,57 @@ class _TakeoverRequest:
 
 
 class TakeoverContextTests(BridgeCase):
+    def test_audio_only_hook_never_restores_or_drops_the_original_text(self):
+        from core.engine import ReplyOutcome
+
+        plugin = self._plugin()
+        plugin.store.add_session("aiocqhttp:GroupMessage:1", session_type="group")
+        plugin.engine.reload_config()
+        event = _TakeoverEvent("在吗")
+        record = _Record("voice.silk")
+
+        async def fake_reply(ctx, history=None):
+            return ReplyOutcome(ok=True, messages=["我在呢"], live_messages=["等一下"])
+
+        heard = []
+
+        async def audio_hook(_event, response):
+            heard.append(response.completion_text)
+            response.result_chain = _Chain([record])
+
+        install_hook_stubs(on_response=audio_hook)
+        plugin.engine.handle_reply = fake_reply
+        try:
+            asyncio.run(plugin.on_llm_request(event, _TakeoverRequest("在吗")))
+        finally:
+            plugin.db.raw.close()
+        self.assertEqual(heard, ["我在呢"])
+        self.assertEqual(len(event.sent), 1)
+        self.assertEqual(event.sent[0].chain, [record])
+
+    def test_rewritten_pending_reply_does_not_include_live_words_again(self):
+        from core.engine import ReplyOutcome
+
+        plugin = self._plugin()
+        plugin.store.add_session("aiocqhttp:GroupMessage:1", session_type="group")
+        plugin.engine.reload_config()
+        event = _TakeoverEvent("查好了没")
+
+        async def fake_reply(ctx, history=None):
+            return ReplyOutcome(ok=True, messages=["结果一", "结果二"], live_messages=["等我查一下"])
+
+        async def rewrite(_event, response):
+            self.assertEqual(response.completion_text, "结果一\n结果二")
+            response.completion_text = "已查好：结果一和结果二"
+
+        install_hook_stubs(on_response=rewrite)
+        plugin.engine.handle_reply = fake_reply
+        try:
+            asyncio.run(plugin.on_llm_request(event, _TakeoverRequest("查好了没")))
+        finally:
+            plugin.db.raw.close()
+        self.assertEqual([part.text for sent in event.sent for part in sent.chain], ["已查好：结果一和结果二"])
+
     def test_perception_part_lands_in_other_context(self):
         """整条接管路径上，helper_tools 的环境感知会进「其他插件提供的上下文」。"""
 

@@ -63,6 +63,7 @@ from .core.models import (
     pronoun_for,
 )
 from .core.nickname import compute_nickname
+from .core.plugin_compat import group_card_owner
 from .core.ports import CardResult, LLMReply, PokeResult, ToolCallResult, ToolInfo
 from .core.prompt import clip_line, prompt_section_index, readable_caption
 from .core.state import FORWARD_SUMMARY_MARK
@@ -2429,6 +2430,9 @@ class AstrBotMessenger:
     async def set_group_card(self, session_id: str, card: str) -> CardResult:
         """设置群名片。只有 aiocqhttp（OneBot）这类支持 call_action 的平台才生效。"""
 
+        owner = self.group_card_owner(session_id)
+        if owner:
+            return CardResult(ok=False, reason=f"群名片由{owner}管理，HW 不覆盖它的名片")
         if not card:
             return CardResult(ok=False, reason="算出来的名片是空的")
         if ":GroupMessage:" not in session_id:
@@ -2458,6 +2462,11 @@ class AstrBotMessenger:
             # 退避由引擎负责，这里只留 debug 日志，避免协议端挂掉时每分钟刷一条
             self.plugin.logger.debug(f"[her_world] 设置群名片失败：{exc}")
             return CardResult(ok=False, reason=f"平台拒绝了：{exc}", card=card)
+
+    def group_card_owner(self, session_id: str) -> str:
+        return group_card_owner(
+            self.plugin.context, session_id, self.plugin.last_event(session_id)
+        )
 
     async def fetch_group_card(self, session_id: str) -> str:
         """读她当前在群里的名片，用作"原名"的兜底。"""
@@ -3132,7 +3141,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Whereis-Alice（原版 exneverbur）",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.2.3",
+    "v2.2.4",
 )
 class HerWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -4332,25 +4341,18 @@ class HerWorldPlugin(Star):
                 event.stop_event()
                 return
             if outcome.ok and (pending_lines or live_lines or routed or routed_images):
-                # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
-                # 钩子看的是她这一轮说过的**全部**话（含已经发出去的那几句），
-                # 不然"等我两分钟"之后再接结果时，靠标记工作的插件会少读到前半句
-                heard = live_lines + pending_lines
+                # 只处理尚未发送的部分：钩子可能合并段落或把正文换成语音，
+                # 不能再靠条数切片来猜哪些话已经发过。
                 bridged, extra_chain = await self._bridge_reply_hooks(
                     event,
-                    heard,
+                    pending_lines,
                     str(getattr(outcome, "tail", "") or ""),
                 )
-                if len(bridged) == len(heard):
-                    bridged = bridged[len(live_lines) :]
-                else:
-                    # 钩子改了条数：位置对不上，就用原样的"还没发的部分"
-                    bridged = list(pending_lines)
                 # 再按换行拆段：一段一条消息，别把好几句挤成一坨；
                 # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
                 payload = self._merge_with_echo(bridged, outcome, echo)
                 sent_ok = True
-                if payload or made_images:
+                if payload or made_images or extra_chain:
                     await self._send_reply(
                         event,
                         payload,
@@ -4662,7 +4664,7 @@ class HerWorldPlugin(Star):
         for slot in range(len(raw) + 1):
             result.extend(buckets.get(slot, []))
             if slot < len(raw):
-                result.extend(self.split_messages([raw[slot]]))
+                result.extend(self.split_messages([bridged[slot]]))
         return result
 
     async def _bridge_reply_hooks(
@@ -4719,6 +4721,7 @@ class HerWorldPlugin(Star):
         except Exception as exc:
             self.logger.warning(f"[her_world] 回复钩子（LLM 响应）执行出错：{exc}")
 
+        restore_result = False
         try:
             from astrbot.core.message.message_event_result import (
                 MessageEventResult,
@@ -4726,6 +4729,7 @@ class HerWorldPlugin(Star):
             )
 
             previous = event.get_result()
+            restore_result = True
             result = MessageEventResult().message("\n".join(messages))
             for component in extra:
                 result.chain.append(component)
@@ -4745,12 +4749,14 @@ class HerWorldPlugin(Star):
             if extra and not texts:
                 # 这一段整体被别的插件换成了非文本内容：正文不要了
                 messages = []
-            if previous is None:
-                event.clear_result()
-            else:
-                event.set_result(previous)
         except Exception as exc:
             self.logger.warning(f"[her_world] 回复钩子（发送前）执行出错：{exc}")
+        finally:
+            if restore_result:
+                if previous is None:
+                    event.clear_result()
+                else:
+                    event.set_result(previous)
         return messages, extra
 
     def _hook_response(self, event: AstrMessageEvent, text: str, response_cls: Any) -> Any:
@@ -5313,6 +5319,7 @@ class HerWorldPlugin(Star):
                     self.engine.world, state, node, base=state.bot_base_nickname
                 )
                 lines = [
+                    f"名片管理方：{self.messenger.group_card_owner(session_id) or '她的世界 HW'}",
                     f"原名（base）：{state.bot_base_nickname or '（空，还没抓到）'}",
                     f"当前名片：{state.bot_current_nickname or '（未知）'}",
                     f"按当前状态应该显示：{desired or '（算不出来）'}",
@@ -6948,6 +6955,7 @@ class HerWorldPlugin(Star):
         if not session_id:
             return error_response("缺少 session 参数")
         snapshot = await self.engine.snapshot(session_id)
+        snapshot["nickname_owner"] = self.messenger.group_card_owner(session_id)
         return json_response(snapshot)
 
     async def api_state_action(self):

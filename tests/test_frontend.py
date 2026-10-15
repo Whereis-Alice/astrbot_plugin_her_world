@@ -462,6 +462,55 @@ def _grab_function(source: str, name: str) -> str:
     raise AssertionError(f"{name} 的括号配不平")
 
 
+class ActionGroupRenameTest(unittest.TestCase):
+    def test_rename_validates_and_moves_every_member_without_touching_ids(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("没有 node")
+        source = APP_JS.read_text("utf-8")
+        script = r'''
+const assert = require("node:assert/strict");
+let dialog, dirty = 0;
+const ui = {actionGroup: "group:原分组", actionCollapsed: new Set(["原分组"])};
+const list = [
+  {id:"a", group:"原分组"}, {id:"b", group:"原分组", enabled:false},
+  {id:"extension", group:"原分组", owner:true}, {id:"c", group:"目标分组"},
+];
+const actions = () => list;
+const actionOwnerOf = action => action.owner ? "extension" : "";
+const groupOfAction = action => action.group;
+const openFormDialog = state => {dialog = state;};
+const markDirty = () => {dirty++;};
+const renderActionGrid = () => {};
+const toast = () => {};
+'''
+        script += _grab_function(source, "renameActionGroup") + r'''
+renameActionGroup("原分组");
+assert.throws(() => dialog.onSubmit({name:"  "}), /不能为空/);
+assert.throws(() => dialog.onSubmit({name:"a".repeat(81)}), /80/);
+assert.throws(() => dialog.onSubmit({name:"目标分组"}), /同名/);
+assert.equal(dirty, 0);
+assert.equal(dialog.onSubmit({name:"原分组"}), true);
+assert.equal(dirty, 0);
+dialog.onSubmit({name:"  新分组  "});
+assert.equal(dirty, 1);
+assert.deepEqual(list.map(a=>a.group), ["新分组","新分组","原分组","目标分组"]);
+assert.deepEqual(list.map(a=>a.id), ["a","b","extension","c"]);
+assert.equal(ui.actionGroup, "group:新分组");
+assert.deepEqual([...ui.actionCollapsed], ["新分组"]);
+renameActionGroup("新分组");
+dialog.onSubmit({name:"目标分组",merge:true});
+assert.equal(ui.actionGroup, "group:目标分组");
+assert.deepEqual(list.map(a=>a.group), ["目标分组","目标分组","原分组","目标分组"]);
+renameActionGroup("不存在");
+assert.throws(() => dialog.onSubmit({name:"另一个"}), /不存在/);
+console.log("ok");
+'''
+        done = subprocess.run([node, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "ok")
+
+
 class SessionScopeTest(unittest.TestCase):
     """「选会话」与「日程落点」的选项表：组 id 也得分得清。
 

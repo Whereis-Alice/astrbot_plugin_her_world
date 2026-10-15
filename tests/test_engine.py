@@ -9435,6 +9435,94 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
     # ---------------- 群名片 ----------------
 
+    async def test_external_card_owner_skips_sync_without_failure_and_resumes(self):
+        owned = {SESSION}
+        self.messenger.group_card_owner = lambda target: "灵动名片" if target in owned else ""
+        await self.set_state(state="sleeping", bot_base_nickname="原名")
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._sync_nickname(state, self.engine.node(state.node_id))
+            self.assertEqual(state.nickname_fail_count, 0)
+            self.assertEqual(state.last_nickname_update_at, 0)
+            self.assertEqual(state.bot_base_nickname, "原名")
+            self.assertEqual(self.messenger.cards, [])
+            owned.clear()
+            await self.engine._sync_nickname(state, self.engine.node(state.node_id))
+        self.assertEqual(len(self.messenger.cards), 1)
+
+    async def test_external_card_owner_is_checked_for_each_group(self):
+        self.add_group()
+        self.messenger.group_card_owner = lambda target: "灵动名片" if target == SESSION else ""
+        await self.set_state(state="sleeping", bot_base_nickname="原名")
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._sync_nickname(state, self.engine.node(state.node_id))
+        self.assertEqual([target for target, _ in self.messenger.cards], [OTHER_SESSION])
+
+    async def test_tool_maintenance_does_not_add_a_second_planned_answer(self):
+        raw = self.store.raw_world()
+        raw["actions"].append({
+            "id": "card_test", "name": "修改群名片", "llm_level": "tool",
+            "scope": "global", "tool_names": ["set_dynamic_group_card"],
+            "on_complete": {"trigger": "none"},
+        })
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        self.tools._tools["set_dynamic_group_card"] = "修改群名片"
+        self.tools.results["set_dynamic_group_card"] = "已修改群名片，请继续回复用户"
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["在。怎么了？"]}]}']
+        outcome = TickOutcome(session_id=SESSION)
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._execute_actions(
+                state, self.engine.node(state.node_id), outcome,
+                [PlannedAction(type="card_test"), PlannedAction(type="say", messages=["嗯？怎么了？"])],
+                depth=0, autonomous=False,
+            )
+        self.assertEqual(outcome.said_messages(), ["嗯？怎么了？"])
+        self.assertEqual(len(self.llm.calls), 0)
+        self.assertEqual(self.tools.calls[0][0], "set_dynamic_group_card")
+
+    async def test_explicit_tool_followup_replaces_the_precomputed_answer_only_if_it_spoke(self):
+        raw = self.store.raw_world()
+        raw["actions"].append({
+            "id": "card_followup", "name": "修改群名片", "llm_level": "tool",
+            "scope": "global", "tool_names": ["set_dynamic_group_card"],
+            "on_complete": {"trigger": "llm_followup"},
+        })
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        self.tools._tools["set_dynamic_group_card"] = "修改群名片"
+        for generated, expected in ((
+            '{"actions":[{"type":"say","messages":["在。怎么了？"]}]}', ["在。怎么了？"],
+        ), ('{"actions":[]}', ["嗯？怎么了？"])):
+            with self.subTest(generated=generated):
+                self.llm.replies = [generated]
+                outcome = TickOutcome(session_id=SESSION)
+                async with self.engine.session_state(SESSION) as state:
+                    await self.engine._execute_actions(
+                        state, self.engine.node(state.node_id), outcome,
+                        [PlannedAction(type="card_followup"), PlannedAction(type="say", messages=["嗯？怎么了？"])],
+                        depth=0, autonomous=False,
+                    )
+                self.assertEqual(outcome.said_messages(), expected)
+
+    async def test_acknowledgement_before_a_tool_does_not_suppress_its_result(self):
+        raw = self.store.raw_world()
+        raw["actions"].append({
+            "id": "result_test", "name": "查询结果", "llm_level": "tool",
+            "scope": "global", "tool_names": ["web_search"],
+            "on_complete": {"trigger": "none"},
+        })
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["查到结果了"]}]}']
+        outcome = TickOutcome(session_id=SESSION)
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._execute_actions(
+                state, self.engine.node(state.node_id), outcome,
+                [PlannedAction(type="say", messages=["等我查一下"]), PlannedAction(type="result_test")],
+                depth=0, autonomous=False,
+            )
+        self.assertEqual(outcome.said_messages(), ["等我查一下", "查到结果了"])
+
     async def test_nickname_uses_bot_name_when_base_is_empty(self):
         """全新安装时状态里没有"原名"，要回落到全局设置里的 Bot 名称，否则永远算不出名片。"""
 
